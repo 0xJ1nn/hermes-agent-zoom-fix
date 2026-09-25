@@ -161,6 +161,14 @@ def _inside_checkout(candidate: str, checkout_root: Path, original_argv0: str) -
     for root in {checkout_root, resolved_root}:
         if root is not None and (path == root or root in path.parents):
             return True
+    try:
+        from hermes_constants import get_default_hermes_root
+        hermes_home = get_default_hermes_root().resolve()
+        for internal in (hermes_home / "installs", hermes_home / "tools", hermes_home / "cache"):
+            if path == internal or internal in path.parents:
+                return True
+    except Exception:
+        pass
     # The `python -m hermes_cli.main` relaunch context surfaces the invoking interpreter as
     # argv[0]; an interpreter is never a launchable entry target (it would persist a bare
     # `<python> desktop`). Compare against argv[0]'s own file, not sys.executable — under test

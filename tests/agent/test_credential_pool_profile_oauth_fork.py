@@ -149,10 +149,12 @@ def test_strip_helper_drops_device_code_blocks_and_reports(tmp_path):
     summary = strip_cloned_single_use_oauth_grants(pdir)
     store = json.loads((pdir / "auth.json").read_text())
     assert sorted(summary["pool"]) == ["anthropic", "xai-oauth"]
-    assert summary["providers"] == ["openai-codex"]
+    # ``nous`` is stripped too: the Portal issues single-use refresh tokens and revokes the whole
+    # session chain on a second redemption, so a cloned copy is a second owner of one credential.
+    assert sorted(summary["providers"]) == ["nous", "openai-codex"]
     assert "xai-oauth" not in store["credential_pool"]
     assert [e["id"] for e in store["credential_pool"]["anthropic"]] == ["key"]
-    assert "openai-codex" not in store["providers"] and "nous" in store["providers"]
+    assert "openai-codex" not in store["providers"] and "nous" not in store["providers"]
 
 
 def test_strip_helper_is_a_noop_without_credentials(tmp_path):

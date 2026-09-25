@@ -746,6 +746,52 @@ def _provider_state_in(store: Dict[str, Any], provider_id: str) -> Optional[Dict
     return dict(state) if isinstance(state, dict) else None
 
 
+def _state_has_credential_material(state: Optional[Dict[str, Any]]) -> bool:
+    """True when *state* still holds a usable credential, i.e. is not a dead husk.
+
+    A terminal refresh failure quarantines the grant: ``_quarantine_nous_oauth_state`` /
+    ``_quarantine_flat_oauth_state`` pop every token key but deliberately KEEP the block, because
+    the routing metadata (``client_id``, ``portal_base_url``, ``inference_base_url``, ``tls``) is
+    still worth persisting alongside ``last_auth_error``. What that leaves behind is a dict with no
+    secret in it at all.
+    """
+    if not isinstance(state, dict) or not state:
+        return False
+    try:
+        from hermes_cli.anon_auth import is_guest_state
+
+        if is_guest_state(state):
+            return True  # the anon_ credential is the identity; it carries no OAuth token pair
+    except Exception:
+        pass
+    if any(str(state.get(k) or "").strip() for k in ("access_token", "refresh_token", "api_key", "agent_key")):
+        return True
+    # Nested shape (Codex / xAI keep the grant under "tokens").
+    tokens = state.get("tokens")
+    if isinstance(tokens, dict) and any(
+            str(tokens.get(k) or "").strip() for k in ("access_token", "refresh_token", "api_key")):
+        return True
+    return False
+
+
+def _resolvable_provider_state(
+    store: Dict[str, Any], provider_id: str,
+) -> Optional[Dict[str, Any]]:
+    """``_provider_state_in``, but a quarantined token-less husk reads as absent.
+
+    A profile that lost the single-use-grant race holds a dead ``providers.<id>`` block. Treating
+    "present but credential-less" as a real state makes the profile shadow the global-root grant
+    that ``_load_provider_state_with_source`` would otherwise fall back to, so the profile latches
+    into ``nous_auth_missing`` forever and demands a per-profile re-login even though a valid
+    login is one directory up. Read-only here: the husk is left on disk for forensics, and the
+    refresh path rewrites the block once the root grant is adopted.
+    """
+    state = _provider_state_in(store, provider_id)
+    if state is None:
+        return None
+    return state if _state_has_credential_material(state) else None
+
+
 def _load_provider_state_with_source(
     auth_store: Dict[str, Any], provider_id: str,
 ) -> tuple[Optional[Dict[str, Any]], Optional[Path]]:
@@ -753,10 +799,10 @@ def _load_provider_state_with_source(
 
     Refresh paths that rotate single-use OAuth refresh tokens must write the updated chain back to
     the same store they read."""
-    state = _provider_state_in(auth_store, provider_id)
+    state = _resolvable_provider_state(auth_store, provider_id)
     if state is not None:
         return state, _auth_file_path()
-    global_state = _provider_state_in(_load_global_auth_store(), provider_id)
+    global_state = _resolvable_provider_state(_load_global_auth_store(), provider_id)
     return (global_state, _global_auth_file_path()) if global_state is not None else (None, None)
 
 

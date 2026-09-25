@@ -960,7 +960,15 @@ REFRESHABLE_OAUTH_PROVIDERS = frozenset({"anthropic", "nous", *_TOKENS_SINGLETON
 
 # Providers whose refresh tokens are single-use: the sync -> POST -> write-back
 # sequence must be serialized across processes under the auth-store flock.
-_SINGLE_USE_REFRESH_PROVIDERS = ("openai-codex", "xai-oauth", "anthropic")
+#
+# ``nous`` belongs here for the same reason "anthropic" was added: the Portal issues
+# SINGLE-USE refresh tokens and revokes the whole session chain when one is redeemed
+# twice ("Refresh session has been revoked" / invalid_grant), so a loser that POSTs a
+# token a peer already rotated does not merely fail -- it kills the login for every
+# profile and workspace at once. Without this entry the Nous refresh runs with no
+# cross-process flock and no in-lock re-sync, which is the omission that let the
+# 6-profile Desktop host race itself into a permanent re-login loop.
+_SINGLE_USE_REFRESH_PROVIDERS = ("openai-codex", "xai-oauth", "anthropic", "nous")
 
 _REFRESH_TIMEOUT_ENV_VARS = {
     "openai-codex": "HERMES_CODEX_REFRESH_TIMEOUT_SECONDS",
@@ -1265,12 +1273,19 @@ class CredentialPool(CredentialPoolAdminMixin, CredentialPoolModelCooldownMixin)
         return entry
 
     def _sync_entry_from_pool_store(self, entry: PooledCredential) -> PooledCredential:
-        """Adopt a token pair rotated by another pool instance (anthropic, xai-oauth).
+        """Adopt a token pair rotated by another pool instance (anthropic, xai-oauth, nous).
 
         Re-reads the exact persisted row from the credential-pool store while
         the shared cross-process auth-store lock is held. Direct integrations
         load a fresh ``CredentialPool`` per request, so in-memory locks cannot
         protect a single-use refresh token across requests or processes.
+
+        This is what makes a lock waiter SKIP the POST: holding the flock without
+        re-reading here would just serialize the race, not prevent a second
+        redemption of an already-spent token. ``nous`` needs it for exactly that
+        reason -- its provider block is the token authority (see
+        ``_refresh_entry_impl``'s Nous branch), so a re-read that finds a
+        peer-rotated pair is the signal to adopt rather than re-POST.
 
         Anthropic borrowed sources (``claude_code``) are excluded: they are
         reference-only rows whose secrets are stripped before reaching
@@ -1279,11 +1294,12 @@ class CredentialPool(CredentialPoolAdminMixin, CredentialPoolModelCooldownMixin)
         the pool store, is token authority for those sources; a row with no
         token material at all is refused for the same reason.
         """
-        if self.provider not in ("anthropic", "xai-oauth") and plugin_refresh_hook(self.provider) is None:
+        if self.provider not in ("anthropic", "xai-oauth", "nous") and plugin_refresh_hook(self.provider) is None:
             return entry
         is_anthropic = self.provider == "anthropic"
         is_xai = self.provider == "xai-oauth"
-        display = {"anthropic": "Anthropic", "xai-oauth": "xAI"}.get(self.provider, self.provider)
+        display = {"anthropic": "Anthropic", "xai-oauth": "xAI", "nous": "Nous"}.get(
+            self.provider, self.provider)
         if is_anthropic and is_borrowed_credential_source(entry.source, self.provider):
             return entry
         try:

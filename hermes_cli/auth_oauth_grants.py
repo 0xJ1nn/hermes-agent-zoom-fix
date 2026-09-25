@@ -23,14 +23,21 @@ logger = logging.getLogger("hermes_cli.auth")
 # ``refresh_token_reused``.
 # Profiles must never receive a copy: ONE grant lives at the global root and named profiles read
 # it through the ``read_credential_pool`` root fallback.
-SINGLE_USE_REFRESH_POOL_PROVIDERS = frozenset({"anthropic", "openai-codex", "xai-oauth"})
+# ``nous`` joins this set: the Portal issues single-use refresh tokens (see
+# ``auth_nous._nous_refresh_error`` — "Nous refresh tokens are single-use") AND re-seeds its pool
+# row from the ``providers.nous`` block, so a forked Nous grant needs BOTH the pool row and the
+# provider block consolidated or the next ``load_pool()`` resurrects the spent pair.
+SINGLE_USE_REFRESH_POOL_PROVIDERS = frozenset({"anthropic", "openai-codex", "xai-oauth", "nous"})
 
 # Singleton credential files holding the same single-use grants outside ``auth.json``. Copying one
 # into a profile re-seeds a forked pool row on the profile's next ``load_pool()``.
 SINGLE_USE_OAUTH_SINGLETON_FILES = (".anthropic_oauth.json",)
 
 # Providers whose device-code grants live under ``providers.<id>`` (not only the pool).
-_DEVICE_CODE_BLOCK_PROVIDERS = ("openai-codex", "xai-oauth")
+# ``nous`` is here because ``auth_nous.persist_nous_credentials`` writes the singleton
+# ``providers.nous`` block and ``load_pool("nous")`` re-seeds the pool row from it — a profile copy
+# of that block is a second owner of the same single-use grant, not an independent login.
+_DEVICE_CODE_BLOCK_PROVIDERS = ("openai-codex", "xai-oauth", "nous")
 
 
 def _is_oauth_pool_payload(entry: Any) -> bool:
@@ -365,8 +372,19 @@ def _heal_forked_provider_block(
         return None
 
     def _flat(block: Dict[str, Any]) -> Dict[str, Any]:
-        tokens = block.get("tokens") if isinstance(block.get("tokens"), dict) else {}
-        return {**tokens, "last_refresh": block.get("last_refresh")}
+        # Codex/xAI nest the grant under ``tokens``; ``nous`` (and any provider
+        # persisted by ``persist_nous_credentials``) keeps the token fields FLAT in
+        # the block. Reading only ``tokens`` made both sides flatten to {} here, so
+        # the freshness comparison silently saw "equal", kept the stale pair in
+        # root, and dropped the live profile copy — losing the only usable grant.
+        # Read the nested dict when present, else fall back to the block's own
+        # token fields.
+        nested = block.get("tokens")
+        tokens: Dict[str, Any] = dict(nested) if isinstance(nested, dict) else {}
+        flat: Dict[str, Any] = dict(block)
+        flat.update(tokens)
+        flat["last_refresh"] = block.get("last_refresh")
+        return flat
 
     p_flat, r_flat = _flat(p_block), _flat(r_block)
     # Provider blocks have no stable pool-row ID. Without a shared token pair
